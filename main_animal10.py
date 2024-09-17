@@ -111,7 +111,6 @@ def test(testloader, encoder, classifier, epoch):
             acc = torch.sum(pred == label) / float(data.size(0))
             accuracy.update(acc.item(), data.size(0))
             data_bar.set_description(f'Test epoch {epoch}: Accuracy#{accuracy.avg:.4f}')
-    logger.log({'acc': accuracy.avg})
     return accuracy.avg
 
 
@@ -254,6 +253,8 @@ def main():
         train(labeled_loader, modified_label, all_loader, encoder, classifier, proj_head, pred_head, optimizer, i, args)
 
         cur_acc = test(test_loader, encoder, classifier, i)
+        logger.log({'acc': cur_acc, 'best acc': best_acc})
+
         scheduler.step()
         if cur_acc > best_acc:
             best_acc = cur_acc
