@@ -1,4 +1,5 @@
 import argparse
+import pickle
 
 import torch.optim.lr_scheduler
 import torchvision.transforms as transforms
@@ -6,14 +7,19 @@ import wandb
 from torch.optim import SGD
 from torch.utils.data import Subset
 from tqdm import tqdm
+from utils.feature import extract_cifar_features as extract_features
+from utils.relabeling import relabel_samples
+from utils.sample_selection import select_samples
 
 from datasets.dataloader_cifar import cifar_dataset
 from models.preresnet import PreResNet18
 from utils import *
 
 parser = argparse.ArgumentParser('Train with synthetic cifar noisy dataset')
-parser.add_argument('--dataset_path', default='~/CIFAR/CIFAR10', help='dataset path')
-parser.add_argument('--noisy_dataset_path', default='~/CIFAR/CIFAR100', help='open-set noise dataset path')
+
+parser.add_argument('--project', default="cifar10_test", type=str, help='project name')
+parser.add_argument('--dataset_path', default='CIFAR/CIFAR10', help='dataset path')
+parser.add_argument('--noisy_dataset_path', default='CIFAR/CIFAR100', help='open-set noise dataset path')
 parser.add_argument('--dataset', default='cifar10', help='dataset name')
 parser.add_argument('--noisy_dataset', default='cifar100', help='open-set noise dataset name')
 
@@ -31,6 +37,9 @@ parser.add_argument('--k', default=200, type=int, help='neighbors for knn sample
 # train settings
 parser.add_argument('--model', default='PreResNet18', help=f'model architecture (default: PreResNet18)')
 parser.add_argument('--epochs', default=300, type=int, metavar='N', help='number of total epochs to run (default: 300)')
+parser.add_argument('--relabeling_strategy', default='base_line', type=str, help='relabeling_strategy')
+parser.add_argument('--sampling_strategy', default='base_line', type=str, help='sampling_strategy')
+
 parser.add_argument('--batch_size', default=128, type=int, help='mini-batch size (default: 128)')
 parser.add_argument('--lr', default=0.02, type=float, help='initial learning rate (default: 0.02)')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M', help='momentum of SGD solver (default: 0.9)')
@@ -113,61 +122,23 @@ def test(testloader, encoder, classifier, epoch):
             acc = torch.sum(pred == label) / float(data.size(0))
             accuracy.update(acc.item(), data.size(0))
             data_bar.set_description(f'Test epoch {epoch}: Accuracy#{accuracy.avg:.4f}')
-    logger.log({'acc': accuracy.avg})
     return accuracy.avg
 
 
-def evaluate(dataloader, encoder, classifier, args, noisy_label, clean_label, i, stat_logs):
+def evaluate(dataloader, encoder, classifier, args, noisy_label):
     encoder.eval()
     classifier.eval()
-    feature_bank = []
-    prediction = []
 
     ################################### feature extraction ###################################
     with torch.no_grad():
-        # generate feature bank
-        for (data, target, _, index) in tqdm(dataloader, desc='Feature extracting'):
-            data = data.cuda()
-            feature = encoder(data)
-            feature_bank.append(feature)
-            res = classifier(feature)
-            prediction.append(res)
-        feature_bank = F.normalize(torch.cat(feature_bank, dim=0), dim=1)
+        feature_bank, preds_logits = extract_features(dataloader, encoder, classifier)
 
-        ################################### sample relabelling ###################################
-        prediction_cls = torch.softmax(torch.cat(prediction, dim=0), dim=1)
-        his_score, his_label = prediction_cls.max(1)
-        print(f'Prediction track: mean: {his_score.mean()} max: {his_score.max()} min: {his_score.min()}')
-        conf_id = torch.where(his_score > args.theta_r)[0]
-        modified_label = torch.clone(noisy_label).detach()
-        modified_label[conf_id] = his_label[conf_id]
-        
-        ################################### sample selection ###################################
-        prediction_knn = weighted_knn(feature_bank, feature_bank, modified_label, args.num_classes, args.k, 10)  # temperature in weighted KNN
-        vote_y = torch.gather(prediction_knn, 1, modified_label.view(-1, 1)).squeeze()
-        vote_max = prediction_knn.max(dim=1)[0]
-        right_score = vote_y / vote_max
-        clean_id = torch.where(right_score >= args.theta_s)[0]
-        noisy_id = torch.where(right_score < args.theta_s)[0]
+        relabeling_result = relabel_samples(torch.cat(preds_logits, dim=0), noisy_label, args)
+        relabeled_ids, modified_label, modified_score, noisy_labels_score = relabeling_result
 
-        ################################### SSR monitor ###################################
-        TP = torch.sum(modified_label[clean_id] == clean_label[clean_id])
-        FP = torch.sum(modified_label[clean_id] != clean_label[clean_id])
-        TN = torch.sum(modified_label[noisy_id] != clean_label[noisy_id])
-        FN = torch.sum(modified_label[noisy_id] == clean_label[noisy_id])
-        print(f'Epoch [{i}/{args.epochs}] selection: theta_s:{args.theta_s} TP: {TP} FP:{FP} TN:{TN} FN:{FN}')
-        logger.log({'TP': TP, 'FP': FP, 'TN': TN, 'FN': FN})
+        clean_candidate_ids, undecided_ids = select_samples(feature_bank, modified_label, args)
 
-        correct = torch.sum(modified_label[conf_id] == clean_label[conf_id])
-        orginal = torch.sum(noisy_label[conf_id] == clean_label[conf_id])
-        all = len(conf_id)
-        logger.log({'correct': correct, 'original': orginal, 'total': all})
-        print(f'Epoch [{i}/{args.epochs}] relabelling:  correct: {correct} original: {orginal} total: {all}')
-
-        stat_logs.write(f'Epoch [{i}/{args.epochs}] selection: theta_s:{args.theta_s} TP: {TP} FP:{FP} TN:{TN} FN:{FN}\n')
-        stat_logs.write(f'Epoch [{i}/{args.epochs}] relabelling:  correct: {correct} original: {orginal} total: {all}\n')
-        stat_logs.flush()
-    return clean_id, noisy_id, modified_label
+    return clean_candidate_ids, undecided_ids, modified_label, modified_score, relabeled_ids, noisy_labels_score
 
 
 def main():
@@ -270,18 +241,71 @@ def main():
     print('Train args: \n', args)
     best_acc = 0
 
+    clean_candidate_ids_per_epochs = {}
+    relabeled_ids_per_epochs = {}
+
     ################################ Training loop ###########################################
     for i in range(args.epochs):
-        clean_id, noisy_id, modified_label = evaluate(eval_loader, encoder, classifier, args, noisy_label, clean_label, i, stat_logs)
+        # clean_candidate_ids, undecided_ids, modified_label = evaluate(eval_loader, encoder, classifier, args, noisy_label, clean_label, i, stat_logs)
+        evaluate_result = evaluate(eval_loader, encoder, classifier, args, noisy_label)
+        clean_candidate_ids, undecided_ids, modified_label, modified_score, relabeled_ids, noisy_labels_score = evaluate_result
+
+        TP = torch.sum(modified_label[clean_candidate_ids] == clean_label[clean_candidate_ids])
+        FP = torch.sum(modified_label[clean_candidate_ids] != clean_label[clean_candidate_ids])
+        TN = torch.sum(modified_label[undecided_ids] != clean_label[undecided_ids])
+        FN = torch.sum(modified_label[undecided_ids] == clean_label[undecided_ids])
+        # print(f'Epoch [{i}/{args.epochs}] selection: theta_s:{args.theta_s} TP: {TP} FP:{FP} TN:{TN} FN:{FN}')
+        correct = torch.sum(modified_label[relabeled_ids] == clean_label[relabeled_ids])
+        all = len(relabeled_ids)
+        precision = (TP)/(TP + FP)
+        recall = (TP)/(TP + FN)
+        f1 = (2 * precision * recall) / (precision + recall)
+
+        clean_candidate_ids_per_epochs[i] = clean_candidate_ids.detach().cpu()
+        relabeled_ids_per_epochs[i] = relabeled_ids.detach().cpu()
+        logger.log({'epoch': i})
+        logger.log({
+            'TP': TP,'FP': FP, 'TN': TN, 'FN': FN,
+            "Precision": precision, "Recall": recall, "F1": f1,
+
+            'number of clean candidate ids': clean_candidate_ids.size()[0],
+            'number of undecided ids': undecided_ids.size()[0],
+            'number of relabeled ids': relabeled_ids.size()[0],
+            'number of correctly relabeled ids': correct,
+
+            'modified score min': torch.min(modified_score),
+            'modified score mean': torch.mean(modified_score),
+            'modified score max': torch.max(modified_score),
+
+            'noisy labels score min': torch.min(noisy_labels_score),
+            'noisy labels score mean': torch.mean(noisy_labels_score),
+            'noisy labels score max': torch.max(noisy_labels_score),
+            
+            'relabeld samples noisy label score min': 0 if noisy_labels_score[relabeled_ids].size()[0] == 0 else torch.min(noisy_labels_score[relabeled_ids]),
+            'relabeld samples noisy label score mean': 0 if noisy_labels_score[relabeled_ids].size()[0] == 0 else torch.mean(noisy_labels_score[relabeled_ids]),
+            'relabeld samples noisy label score max': 0 if noisy_labels_score[relabeled_ids].size()[0] == 0 else torch.max(noisy_labels_score[relabeled_ids]),
+
+            'relabeld samples relabeld label score min': 0 if modified_score[relabeled_ids].size()[0] == 0 else torch.min(modified_score[relabeled_ids]),
+            'relabeld samples relabeld label score mean': 0 if modified_score[relabeled_ids].size()[0] == 0 else torch.mean(modified_score[relabeled_ids]),
+            'relabeld samples relabeld label score max': 0 if modified_score[relabeled_ids].size()[0] == 0 else torch.max(modified_score[relabeled_ids]),
+        })
+
+        # print(f'Epoch [{i}/{args.epochs}] relabelling:  correct: {correct} original: {orginal} total: {all}')
+
+        stat_logs.write(f'Epoch [{i}/{args.epochs}] selection: theta_s:{args.theta_s} TP: {TP} FP:{FP} TN:{TN} FN:{FN}\n')
+        stat_logs.write(f'Epoch [{i}/{args.epochs}] relabelling:  correct: {correct} total: {all}\n')
+        stat_logs.flush()
+
 
         # balanced_sampler
-        clean_subset = Subset(train_data, clean_id.cpu())
-        sampler = ClassBalancedSampler(labels=modified_label[clean_id], num_classes=args.num_classes)
+        clean_subset = Subset(train_data, clean_candidate_ids.cpu())
+        sampler = ClassBalancedSampler(labels=modified_label[clean_candidate_ids], num_classes=args.num_classes)
         labeled_loader = torch.utils.data.DataLoader(clean_subset, batch_size=args.batch_size, sampler=sampler, num_workers=4, drop_last=True)
      
         train(labeled_loader, modified_label, all_loader, encoder, classifier, proj_head, pred_head, optimizer, i, args)
 
         cur_acc = test(test_loader, encoder, classifier, i)
+        logger.log({'acc': cur_acc, 'best acc': best_acc})
         scheduler.step()
         if cur_acc > best_acc:
             best_acc = cur_acc
@@ -296,6 +320,12 @@ def main():
         acc_logs.write(f'Epoch [{i}/{args.epochs}]: Best accuracy@{best_acc}! Current accuracy@{cur_acc} \n')
         acc_logs.flush()
         print(f'Epoch [{i}/{args.epochs}]: Best accuracy@{best_acc}! Current accuracy@{cur_acc} \n')
+
+    with open(f'logs/cifar10_{args.noise_mode}_{args.noise_ratio}_clean_candidate_ids_per_epochs.pkl', 'wb') as f:
+        pickle.dump(clean_candidate_ids_per_epochs, f)
+
+    with open(f'logs/cifar10_{args.noise_mode}_{args.noise_ratio}_relabeled_ids_per_epochs.pkl', 'wb') as f:
+        pickle.dump(relabeled_ids_per_epochs, f)
 
     save_checkpoint({
         'cur_epoch': args.epochs,
