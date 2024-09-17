@@ -225,10 +225,6 @@ def main():
         clean_candidate_ids, undecided_ids, modified_label, modified_score, relabeled_ids, human_labels_score = evaluate_result
         clean_candidate_ids_per_epochs[i] = clean_candidate_ids.detach().cpu()
         relabeled_ids_per_epochs[i] = relabeled_ids.detach().cpu()
-        print("modified_score.size()", modified_score.size())
-        print("modified_score[relabeled_ids]", modified_score[relabeled_ids])
-        print("human_labels_score.size()", human_labels_score.size())
-        print("human_labels_score[relabeled_ids].size()", human_labels_score[relabeled_ids].size())
         logger.log({'epoch': i})
         logger.log({
             'number of clean candidate ids': clean_candidate_ids.size()[0],
