@@ -13,7 +13,7 @@ def relabel_samples_base_line(preds_logits: tensor, human_labels, args):
     his_score, his_label = preds_proba.max(1)
 
     human_labels_score = preds_proba[torch.arange(preds_logits.size()[0]), human_labels]
-    relabeled_ids = torch.where(his_score > args.theta_r)[0]
+    relabeled_ids = torch.where((his_score > args.theta_r) & (his_label != human_labels))[0]
     
     modified_label = torch.clone(human_labels).detach()
     modified_label[relabeled_ids] = his_label[relabeled_ids]
