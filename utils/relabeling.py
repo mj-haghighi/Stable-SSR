@@ -43,7 +43,7 @@ def relabel_samples_stable_score(preds_logits: tensor, human_labels, args, stabi
     modified_label = torch.clone(human_labels).detach()
     modified_label[relabeled_ids] = his_label[relabeled_ids]
     
-    modified_score = torch.clone(his_score)
+    modified_score = torch.clone(human_labels_score)
     modified_score[relabeled_ids] = his_score[relabeled_ids]
     
     return relabeled_ids, modified_label, modified_score, human_labels_score
