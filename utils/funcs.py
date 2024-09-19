@@ -8,6 +8,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import ImageFilter
+from collections import deque
+
 
 
 def seed_everything(seed: int):
@@ -195,3 +197,63 @@ class GaussianBlur(object):
         sigma = random.uniform(self.sigma[0], self.sigma[1])
         x = x.filter(ImageFilter.GaussianBlur(radius=sigma))
         return x
+
+
+
+class FixedSizeQueue:
+    def __init__(self, size):
+        self.size = size
+        self.queue = deque(maxlen=size)
+
+    def enqueue(self, item):
+        self.queue.append(item)
+
+    def dequeue(self):
+        if len(self.queue) > 0:
+            return self.queue.popleft()
+        else:
+            return None  # Queue is empty
+
+    def items(self):
+        return list(self.queue)
+
+    def __str__(self):
+        return str(list(self.queue))
+    
+
+def calculate_label_confidence_score(sample_pred_label_score_window: FixedSizeQueue, window_size):
+    per_sample_confince =  torch.tensor([], dtype=float)
+    print('len(sample_pred_label_score_window.items()): ', len(sample_pred_label_score_window.items()))
+    if len(sample_pred_label_score_window.items()) >= (window_size // 4):
+        per_sample = torch.stack(sample_pred_label_score_window.items())
+        per_sample_confince = torch.mean(per_sample, dim=0)
+        assert per_sample_confince.size() == (50000,)
+    return per_sample_confince
+
+
+def calculate_stabelity_score(sample_pred_label_window: FixedSizeQueue, window_size):
+    stable_label, stability_score = torch.tensor([], dtype=int), torch.tensor([], dtype=float)
+    if len(sample_pred_label_window.items()) >= window_size:
+        stable_label, stability_score = calculate_stabelity_per_sample(sample_pred_label_window)
+    return stable_label, stability_score
+
+
+def most_repetitive_item(tensor):
+    values, counts = torch.unique(tensor, return_counts=True)
+    idx = torch.argmax(counts)
+    value = values[idx]
+    count = counts[idx]
+    ratio = count / torch.sum(counts)
+    
+    return value, ratio 
+
+
+def calculate_stabelity_per_sample(sample_pred_label_window):
+    per_sample = torch.stack(sample_pred_label_window.items()) 
+    stabelity = torch.tensor(
+        [most_repetitive_item(per_sample[:, i]) for i in range(per_sample.size()[1])]
+    ).cuda()
+    assert stabelity.size(0) == 50000    
+    labels = stabelity[:, 0]
+    ratios = stabelity[:, 1]
+    return labels, ratios

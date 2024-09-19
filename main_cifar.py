@@ -14,10 +14,11 @@ from utils.sample_selection import select_samples
 from datasets.dataloader_cifar import cifar_dataset
 from models.preresnet import PreResNet18
 from utils import *
+from utils.funcs import FixedSizeQueue, calculate_stabelity_score
 
 parser = argparse.ArgumentParser('Train with synthetic cifar noisy dataset')
 
-parser.add_argument('--project', default="cifar10_test", type=str, help='project name')
+parser.add_argument('--project', default="cifar10_stable_test", type=str, help='project name')
 parser.add_argument('--dataset_path', default='CIFAR/CIFAR10', help='dataset path')
 parser.add_argument('--noisy_dataset_path', default='CIFAR/CIFAR100', help='open-set noise dataset path')
 parser.add_argument('--dataset', default='cifar10', help='dataset name')
@@ -25,20 +26,24 @@ parser.add_argument('--noisy_dataset', default='cifar100', help='open-set noise 
 
 # dataset settings
 parser.add_argument('--noise_mode', default='sym', type=str, help='artifical noise mode (default: symmetric)')
-parser.add_argument('--noise_ratio', default=0.5, type=float, help='artifical noise ratio (default: 0.5)')
+parser.add_argument('--noise_ratio', default=0.2, type=float, help='artifical noise ratio (default: 0.5)')
 parser.add_argument('--open_ratio', default=0.0, type=float, help='artifical noise ratio (default: 0.0)')
 
 # model settings
 parser.add_argument('--theta_s', default=1.0, type=float, help='threshold for selecting samples (default: 1)')
-parser.add_argument('--theta_r', default=0.9, type=float, help='threshold for relabelling samples (default: 0.9)')
+parser.add_argument('--theta_r', default=0.94, type=float, help='threshold for relabelling samples (default: 0.9)')
+parser.add_argument('--theta_extend', default=0.94, type=int, help='window_size of stable strategy')
+parser.add_argument('--theta_exclude', default=0.49, type=int, help='window_size of stable strategy')
 parser.add_argument('--lambda_fc', default=1.0, type=float, help='weight of feature consistency loss (default: 1.0)')
 parser.add_argument('--k', default=200, type=int, help='neighbors for knn sample selection (default: 200)')
 
 # train settings
 parser.add_argument('--model', default='PreResNet18', help=f'model architecture (default: PreResNet18)')
 parser.add_argument('--epochs', default=300, type=int, metavar='N', help='number of total epochs to run (default: 300)')
-parser.add_argument('--relabeling_strategy', default='base_line', type=str, help='relabeling_strategy')
-parser.add_argument('--sampling_strategy', default='base_line', type=str, help='sampling_strategy')
+parser.add_argument('--relabeling_strategy', default='stable', type=str, help='relabeling_strategy')
+parser.add_argument('--sampling_strategy', default='stable_extended_excluded', type=str, help='sampling_strategy')
+# parser.add_argument('--min_window_size', default=5, type=int, help='window_size of stable strategy')
+parser.add_argument('--window_size', default=20, type=int, help='window_size of stable strategy')
 
 parser.add_argument('--batch_size', default=128, type=int, help='mini-batch size (default: 128)')
 parser.add_argument('--lr', default=0.02, type=float, help='initial learning rate (default: 0.02)')
@@ -125,7 +130,7 @@ def test(testloader, encoder, classifier, epoch):
     return accuracy.avg
 
 
-def evaluate(dataloader, encoder, classifier, args, noisy_label):
+def evaluate(dataloader, encoder, classifier, args, noisy_label, stability_score, noisy_labels_confidnce_score):
     encoder.eval()
     classifier.eval()
 
@@ -133,12 +138,13 @@ def evaluate(dataloader, encoder, classifier, args, noisy_label):
     with torch.no_grad():
         feature_bank, preds_logits = extract_features(dataloader, encoder, classifier)
 
-        relabeling_result = relabel_samples(torch.cat(preds_logits, dim=0), noisy_label, args)
+        relabeling_result = relabel_samples(torch.cat(preds_logits, dim=0), noisy_label, args, stability_score, noisy_labels_confidnce_score)
         relabeled_ids, modified_label, modified_score, noisy_labels_score = relabeling_result
 
-        clean_candidate_ids, undecided_ids = select_samples(feature_bank, modified_label, args)
+        selection_result = select_samples(feature_bank, modified_label, args, stability_score)
+        clean_candidate_ids, undecided_ids, clean_id_extended, clean_id_excluded = selection_result
 
-    return clean_candidate_ids, undecided_ids, modified_label, modified_score, relabeled_ids, noisy_labels_score
+    return clean_candidate_ids, undecided_ids, clean_id_extended, clean_id_excluded, modified_label, modified_score, relabeled_ids, noisy_labels_score
 
 
 def main():
@@ -243,12 +249,31 @@ def main():
 
     clean_candidate_ids_per_epochs = {}
     relabeled_ids_per_epochs = {}
+    sample_pred_label_window = FixedSizeQueue(args.window_size)
+    sample_pred_noisy_label_score_window = FixedSizeQueue(args.window_size // 4)
 
     ################################ Training loop ###########################################
     for i in range(args.epochs):
+        if i > 100:
+            args.theta_r += 0.049
+            args.theta_extend += 0.049
         # clean_candidate_ids, undecided_ids, modified_label = evaluate(eval_loader, encoder, classifier, args, noisy_label, clean_label, i, stat_logs)
-        evaluate_result = evaluate(eval_loader, encoder, classifier, args, noisy_label)
-        clean_candidate_ids, undecided_ids, modified_label, modified_score, relabeled_ids, noisy_labels_score = evaluate_result
+        stable_label, stability_score = calculate_stabelity_score(sample_pred_label_window, args.window_size)
+        noisy_labels_confidnce_score = calculate_label_confidence_score(sample_pred_noisy_label_score_window, args.window_size)
+        evaluate_result = evaluate(eval_loader, encoder, classifier, args, noisy_label, stability_score, noisy_labels_confidnce_score)
+        raw_clean_candidate_ids, raw_undecided_ids, clean_id_extended, clean_id_excluded, modified_label, modified_score, relabeled_ids, noisy_labels_score = evaluate_result
+        
+
+        exclude_mask = ~torch.isin(raw_clean_candidate_ids, clean_id_excluded)
+        clean_candidate_id_filtered = raw_clean_candidate_ids[exclude_mask]
+        clean_candidate_ids = torch.unique(torch.cat((clean_candidate_id_filtered, clean_id_extended)))
+
+        mask = ~torch.isin(raw_undecided_ids, clean_id_extended)
+        undecided_ids_filtered = raw_undecided_ids[mask]
+        undecided_ids = torch.unique(torch.cat((undecided_ids_filtered, clean_id_excluded)))
+
+        sample_pred_label_window.enqueue(modified_label)
+        sample_pred_noisy_label_score_window.enqueue(noisy_labels_score)
 
         TP = torch.sum(modified_label[clean_candidate_ids] == clean_label[clean_candidate_ids])
         FP = torch.sum(modified_label[clean_candidate_ids] != clean_label[clean_candidate_ids])
@@ -263,6 +288,7 @@ def main():
 
         clean_candidate_ids_per_epochs[i] = clean_candidate_ids.detach().cpu()
         relabeled_ids_per_epochs[i] = relabeled_ids.detach().cpu()
+        
         logger.log({'epoch': i})
         logger.log({
             'TP': TP,'FP': FP, 'TN': TN, 'FN': FN,
@@ -272,6 +298,8 @@ def main():
             'number of undecided ids': undecided_ids.size()[0],
             'number of relabeled ids': relabeled_ids.size()[0],
             'number of correctly relabeled ids': correct,
+            'extended clean ids': raw_clean_candidate_ids.size()[0] - clean_candidate_id_filtered.size()[0],
+            'excluded clean ids': clean_candidate_ids.size()[0] - clean_candidate_id_filtered.size()[0],
 
             'modified score min': torch.min(modified_score),
             'modified score mean': torch.mean(modified_score),
