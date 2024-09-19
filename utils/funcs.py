@@ -223,8 +223,7 @@ class FixedSizeQueue:
 
 def calculate_label_confidence_score(sample_pred_label_score_window: FixedSizeQueue, window_size):
     per_sample_confince =  torch.tensor([], dtype=float)
-    print('len(sample_pred_label_score_window.items()): ', len(sample_pred_label_score_window.items()))
-    if len(sample_pred_label_score_window.items()) >= (window_size // 4):
+    if len(sample_pred_label_score_window.items()) >= (window_size):
         per_sample = torch.stack(sample_pred_label_score_window.items())
         per_sample_confince = torch.mean(per_sample, dim=0)
         assert per_sample_confince.size() == (50000,)
