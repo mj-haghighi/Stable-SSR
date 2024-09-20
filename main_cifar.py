@@ -18,7 +18,7 @@ from utils.funcs import FixedSizeQueue, calculate_stabelity_score
 
 parser = argparse.ArgumentParser('Train with synthetic cifar noisy dataset')
 
-parser.add_argument('--project', default="cifar10_stable_test", type=str, help='project name')
+parser.add_argument('--project', default="cifar10_stable", type=str, help='project name')
 parser.add_argument('--dataset_path', default='CIFAR/CIFAR10', help='dataset path')
 parser.add_argument('--noisy_dataset_path', default='CIFAR/CIFAR100', help='open-set noise dataset path')
 parser.add_argument('--dataset', default='cifar10', help='dataset name')
@@ -42,7 +42,6 @@ parser.add_argument('--model', default='PreResNet18', help=f'model architecture 
 parser.add_argument('--epochs', default=300, type=int, metavar='N', help='number of total epochs to run (default: 300)')
 parser.add_argument('--relabeling_strategy', default='stable', type=str, help='relabeling_strategy')
 parser.add_argument('--sampling_strategy', default='stable_extended_excluded', type=str, help='sampling_strategy')
-# parser.add_argument('--min_window_size', default=5, type=int, help='window_size of stable strategy')
 parser.add_argument('--window_size', default=10, type=int, help='window_size of stable strategy')
 
 parser.add_argument('--batch_size', default=128, type=int, help='mini-batch size (default: 128)')
