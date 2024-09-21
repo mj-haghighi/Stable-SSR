@@ -5,7 +5,7 @@ import random
 from torchvision.datasets.cifar import *
 from typing import Any, Callable, Optional, Tuple
 import torch
-
+from utils.enums import NOISE_MODE
 
 def unpickle(file):
     import _pickle as cPickle
@@ -53,6 +53,7 @@ class cifar_dataset(Dataset):
                 cifar_label = cifar_dic['fine_labels']
                 self.cifar_data = cifar_dic['data'].reshape((50000, 3, 32, 32)).transpose((0, 2, 3, 1))
             self.clean_label = cifar_label
+
             if noisy_dataset == 'imagenet32':
                 noise_data = None
             else:
@@ -75,6 +76,12 @@ class cifar_dataset(Dataset):
                         self.cifar_data[cleanIdx] = noise_data[noisyIdx]
                         self.clean_label[cleanIdx] = 10
                 self.cifar_label = noise_labels
+            if noise_mode == NOISE_MODE.AGGRE:
+                labels = torch.load("/home/vision/Repo/Stable-SSR/CIFAR/CIFAR10/cifar-10-batches-py/CIFAR-10_human.pt")
+                self.cifar_label = labels['aggre_label']
+            elif noise_mode == NOISE_MODE.WORSE:
+                labels = torch.load("/home/vision/Repo/Stable-SSR/CIFAR/CIFAR10/cifar-10-batches-py/CIFAR-10_human.pt")
+                self.cifar_label = labels['worse_label']
             else:
                 # inject noise
                 noise_labels = []  # all labels (some noisy, some clean)
