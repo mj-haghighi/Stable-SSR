@@ -6,15 +6,18 @@ import torchvision.transforms as transforms
 import wandb
 from torch.optim import SGD
 from torch.utils.data import Subset
+import torch
+import torch.nn as nn
 from tqdm import tqdm
 from utils.feature import extract_cifar_features as extract_features
 from utils.relabeling import relabel_samples
 from utils.sample_selection import select_samples
-
+from torchvision.models import resnet18, ResNet18_Weights
 from datasets.dataloader_cifar import cifar_dataset
 from models.preresnet import PreResNet18
 from utils import *
 from utils.funcs import FixedSizeQueue, calculate_stabelity_score
+
 
 parser = argparse.ArgumentParser('Train with synthetic cifar noisy dataset')
 
@@ -42,6 +45,7 @@ parser.add_argument('--model', default='PreResNet18', help=f'model architecture 
 parser.add_argument('--epochs', default=300, type=int, metavar='N', help='number of total epochs to run (default: 300)')
 parser.add_argument('--relabeling_strategy', default='stable', type=str, help='relabeling_strategy')
 parser.add_argument('--sampling_strategy', default='stable_extended_excluded', type=str, help='sampling_strategy')
+parser.add_argument('--expert_encoder', default=True, type=int, help='use expert_encoder')
 parser.add_argument('--window_size', default=10, type=int, help='window_size of stable strategy')
 
 parser.add_argument('--batch_size', default=128, type=int, help='mini-batch size (default: 128)')
@@ -129,13 +133,18 @@ def test(testloader, encoder, classifier, epoch):
     return accuracy.avg
 
 
-def evaluate(dataloader, encoder, classifier, args, noisy_label, stability_score, stable_label, noisy_labels_confidnce_score):
+def evaluate(ci, dataloader, encoder, classifier, args, noisy_label, stability_score, stable_label, noisy_labels_confidnce_score, expert_encoder=None):
     encoder.eval()
     classifier.eval()
 
     ################################### feature extraction ###################################
     with torch.no_grad():
-        feature_bank, preds_logits = extract_features(dataloader, encoder, classifier)
+        if args.expert_encoder and ci < args.window_size:
+            feature_bank, _ = extract_features(dataloader, expert_encoder, None)
+            feature_bank = torch.squeeze(feature_bank) 
+            _, preds_logits = extract_features(dataloader, encoder, classifier)
+        else:
+            feature_bank, preds_logits = extract_features(dataloader, encoder, classifier)
 
         relabeling_result = relabel_samples(torch.cat(preds_logits, dim=0), noisy_label, args, stability_score, stable_label, noisy_labels_confidnce_score)
         relabeled_ids, modified_label, modified_score, model_pred_label, noisy_labels_score = relabeling_result
@@ -219,6 +228,11 @@ def main():
 
     ################################ Model initialization ###########################################
     encoder = PreResNet18(args.num_classes)
+    expert_encoder = None
+    if args.expert_encoder:
+        expert_encoder = nn.Sequential(*list(resnet18(weights=ResNet18_Weights.DEFAULT).children())[:-1]) 
+        expert_encoder.cuda()
+        expert_encoder.eval()
     classifier = torch.nn.Linear(encoder.fc.in_features, args.num_classes)
     proj_head = torch.nn.Sequential(torch.nn.Linear(encoder.fc.in_features, 256),
                                     torch.nn.BatchNorm1d(256),
@@ -248,6 +262,8 @@ def main():
 
     clean_candidate_ids_per_epochs = {}
     relabeled_ids_per_epochs = {}
+    extended_ids_per_epochs = {}
+    excluded_ids_per_epochs = {}
     sample_pred_label_window = FixedSizeQueue(args.window_size)
     sample_pred_noisy_label_score_window = FixedSizeQueue(args.window_size)
 
@@ -255,7 +271,7 @@ def main():
     for i in range(args.epochs):
         stable_label, stability_score = calculate_stabelity_score(sample_pred_label_window, args.window_size)
         noisy_labels_confidnce_score = calculate_label_confidence_score(sample_pred_noisy_label_score_window, args.window_size)
-        evaluate_result = evaluate(eval_loader, encoder, classifier, args, noisy_label, stability_score, stable_label, noisy_labels_confidnce_score)
+        evaluate_result = evaluate(i, eval_loader, encoder, classifier, args, noisy_label, stability_score, stable_label, noisy_labels_confidnce_score, expert_encoder)
         raw_clean_candidate_ids, raw_undecided_ids, clean_id_extended, clean_id_excluded, modified_label, modified_score, model_pred_label, relabeled_ids, noisy_labels_score = evaluate_result
         
 
@@ -283,18 +299,23 @@ def main():
 
         clean_candidate_ids_per_epochs[i] = clean_candidate_ids.detach().cpu()
         relabeled_ids_per_epochs[i] = relabeled_ids.detach().cpu()
+        excluded_ids_per_epochs[i] = clean_id_excluded.detach().cpu()
+        m = torch.isin(raw_undecided_ids, clean_id_extended)
+        extended_ids_per_epochs[i] = raw_undecided_ids[m].detach().cpu()
+        
         
         logger.log({'epoch': i})
         logger.log({
             'TP': TP,'FP': FP, 'TN': TN, 'FN': FN,
             "Precision": precision, "Recall": recall, "F1": f1,
 
+            'number of KNN selection candidate ids': raw_clean_candidate_ids.size()[0],
             'number of clean candidate ids': clean_candidate_ids.size()[0],
             'number of undecided ids': undecided_ids.size()[0],
             'number of relabeled ids': relabeled_ids.size()[0],
             'number of correctly relabeled ids': correct,
-            'extended clean ids': raw_clean_candidate_ids.size()[0] - clean_candidate_id_filtered.size()[0],
-            'excluded clean ids': clean_candidate_ids.size()[0] - clean_candidate_id_filtered.size()[0],
+            'excluded clean ids': raw_clean_candidate_ids.size()[0] - clean_candidate_id_filtered.size()[0],
+            'extended clean ids': clean_candidate_ids.size()[0] - clean_candidate_id_filtered.size()[0],
 
             'modified score min': torch.min(modified_score),
             'modified score mean': torch.mean(modified_score),
@@ -349,6 +370,13 @@ def main():
 
     with open(f'logs/cifar10_{args.noise_mode}_{args.noise_ratio}_relabeled_ids_per_epochs.pkl', 'wb') as f:
         pickle.dump(relabeled_ids_per_epochs, f)
+
+    with open(f'logs/cifar10_{args.noise_mode}_{args.noise_ratio}_excluded_ids_per_epochs.pkl', 'wb') as f:
+        pickle.dump(excluded_ids_per_epochs, f)
+
+    with open(f'logs/cifar10_{args.noise_mode}_{args.noise_ratio}_extended_ids_per_epochs.pkl', 'wb') as f:
+        pickle.dump(extended_ids_per_epochs, f)
+
 
     save_checkpoint({
         'cur_epoch': args.epochs,
