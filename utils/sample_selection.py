@@ -7,6 +7,9 @@ def select_samples(feature_bank, modified_label, args, stability_score):
         return select_samples_base_line(feature_bank, modified_label, args)
     elif args.sampling_strategy == SamplingStrategy.STABLE_EXTENDED_EXCLUDED:
         return select_samples_extended_excluded(feature_bank, modified_label, args, stability_score)
+    elif args.sampling_strategy == SamplingStrategy.STABLE:
+        return select_samples_stable(feature_bank, modified_label, args, stability_score)
+
     raise Exception("selection strategy is not valid")
 
 def select_samples_base_line(feature_bank, modified_label, args):
